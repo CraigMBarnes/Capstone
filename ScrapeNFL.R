@@ -1,3 +1,5 @@
+# Original author: Craig M. Barnes
+# last edit: 12/6/2020
 # Load libraries
 library(tidyverse)
 library(rvest)
