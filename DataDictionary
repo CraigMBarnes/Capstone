@@ -8,7 +8,7 @@ Final DF:    1335 obs. of  23 variables
 
   $ d_FirstDowns      : int  3, First downs are a fundamental football statistic. They represent the ability to continue on offense, and in simplest terms, if you have more first downs, you should have more chances to score points.
 
-  $ d_Rushes          : num  -1, How many times did the team run the ball. This is when the ball is handed to a playing, rather than throwing the ball.
+  $ d_Rushes          : num  -1, How many times did the team run the ball. This is when the ball is handed to a player, rather than throwing the ball.
 
   $ d_RushYards       : num  -54, See Rushes. This is how far the player who rushed was able to travel, summed up.
 
