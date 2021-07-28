@@ -1,0 +1,585 @@
+---
+title: "HarvardX Capstone: Movielens"
+author: "Craig Barnes"
+date: "7/25/2021"
+output: 
+  pdf_document:
+    fig_height: 4
+    fig_width: 4
+    highlight: pygments
+    toc: TRUE
+  html_document: 
+    df_print: kable
+    theme: yeti
+urlcolor: blue
+---
+
+```{r setup, include=FALSE, cache.lazy=FALSE}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if (!require(knitr)) install.packages('knitr', repos='http://cran.us.r-project.org')
+if (!require(tibble)) install.packages('tibble', repos='http://cran.us.r-project.org')
+library(tidyverse)
+library(caret)
+library(data.table)
+library(knitr)
+library(tibble)
+#
+options("scipen"=100, "digits"=4)
+knitr::opts_chunk$set(echo = TRUE,comment = ">",tidy.opts=list(width.cutoff=80),tidy=TRUE)
+```
+
+## Intro / Project Overview
+Since the early days of the internet, people have talked about movies and given them ratings and reviews. The birth of Netflix (among other streaming services like Hulu) gave rise to one specific kind of data science, Recommendation Systems!  
+
+The HarvardX Data Science Capstone: Movielens project is built upon the question:  
+
+|         "Can I predict what rating any particular user should give to any certain movie?"
+
+The Root Mean Squared Error targets are below:  
+ 5 points: >= .9  
+ 10 points: 0.86550 <= RMSE <= 0.89999  
+ 15 points: 0.86500 <= RMSE <= 0.86549  
+ 20 points: 0.86490 <= RMSE <= 0.86499  
+ 25 points: RMSE < 0.86490  
+
+I built a project from scratch that pulls together all the different levels of complexity when creating a Recommendation System. Recall from our Machine Learning course that some factors to be considered are: each movie is unique in quality and came out during a specific era, each user has their own preferences with respect to movie genres, actors, etc. Also, movies can be brand new or classics (i.e. much older), and generally speaking some genres of movies are simply more agreeable to more people!  
+
+In the modeling phase, I attempted a few different options.  First, I tried to create a "user profile" and some similarity matrices that would function as relational databases in a way. This option was very accurate, but not flexible and it took a few seconds per prediction to run. This would have taken a week or so to execute a million rows! Secondly, I attempted to fit some simple models based off user/genre preferences. This was not accurate enough to move forward with, but was very fast. Finally, I went with what would serve both an accurate prediction and run quickly enough. The methodology is similar to how we built out predictions in our ML course. Mainly, I didn't want to use a package that did all the analysis for me, like Recosystem for example. Sadly, I tried to beat the Netflix challenge goal of <.8649 and could not...I was able to get in the .87 range though, after a number of different techniques.  
+
+The model presented below uses a number of the above components to build out a best guess based on what we know from the training set. In the end, I think that every model can be improved upon...but for the purpose of this project (and given my hardware limitations) this exercise helped to reinforce a ton of skills I learned from the HarvardX Data Science program!  
+
+## Part 1: The Data
+The data itself for the Movielens project is pretty straightforward. Since all students are using the same data, I will not go through the trivial aspects of it, but it is very interesting to note how many users there are compared to movies (~70k users vs 10.6k movies). These dimensions, combined with that fact that not many users rate a lot of movies creates the sparse-matrix that we have seen. In my opinion, this creates the biggest hurdle to the exercise.  
+
+The basic dataset has six columns, all of which I use in one way or another.  
+**userId** and **movieId** are critical, and of course **rating** is our Y-variable if you consider a formula such as Y~x1+x2+x3.  
+**timestamp** is used to calculate how old a movie was when it was reviewed, and year is pulled from the movie **title** and is simply put how old it is now (when compared to this year.)  
+**genres** is used to create some one-hot encoding that I fit a small linear model with to test out the effects each genre has to the average rating.  
+
+```{r Download Data and quick explore, comment="", echo=FALSE, warning=FALSE, cache=TRUE}
+time1 <- Sys.time()
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+#
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+#
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+#
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId), title = as.character(title), genres = as.character(genres))
+#
+movielens <- left_join(ratings, movies, by = "movieId")
+#
+rm(movies,ratings,dl)
+#
+
+#movielens <- as.data.frame(read.csv("~/Desktop/movielens.csv", stringsAsFactors = F))
+#
+# Exploration ----
+#
+paste("Here's a look at the raw data before any modifications:", sep="")
+glimpse(movielens[1:5,])
+# unique users
+x <- unique(movielens$userId)
+paste("Number of Unique Users: ", length(x), sep="")
+# unique movies
+x <- unique(movielens$movieId)
+paste("Number of Unique Movies: ", length(x), sep="")
+# genres
+x <- movielens %>% select(genres, movieId) %>% distinct(movieId, genres) %>% separate_rows(genres, sep ="\\|")
+genre_count <- x %>% group_by(genres) %>% summarize(n = n(), .groups = "drop") %>% arrange(-n)  %>% as.data.frame()
+paste("Number of Movies that fall into each genre: ", sep="")
+genre_count[1:10,]
+rm(x,genre_count)
+#
+
+```
+
+The next section shows some feature engineering referenced above. I create the year-reviewed out of the **timestamp**, and then some one-hot encoding columns using str_detect.  
+Next, I extract the **year** the movie came out from the **title**.  
+Then, I create some discrete age buckets comprised of 1 year or less old, 3 years or less old, 5 years or less old...all the way to 50 years old or more.  
+These all serve to give me some more color as I segment out different users and movies based on various traits - for example:  
+
+|         Should a 5 year old comedy have a better rating than a 30 year old drama on average (all else equal)?
+
+
+```{r Feature Engineering, tidy=TRUE, tidy.opts=list(width.cutoff=80)}
+#
+# Feature engineering prior to split
+# get a timestamp, add some one-hot encoding for top 10 genres
+movielens$timestamp <- as.Date(as.POSIXct(movielens$timestamp, origin = "1970-01-01"))
+movielens$Drama1h <- ifelse(str_detect(movielens$genres,"Drama"),1,0)
+movielens$Comedy1h <- ifelse(str_detect(movielens$genres,"Comedy"),1,0)
+movielens$Thriller1h <- ifelse(str_detect(movielens$genres,"Thriller"),1,0)
+movielens$Romance1h <- ifelse(str_detect(movielens$genres,"Romance"),1,0)
+movielens$Action1h <- ifelse(str_detect(movielens$genres,"Action"),1,0)
+movielens$Crime1h <- ifelse(str_detect(movielens$genres,"Crime"),1,0)
+movielens$Adventure1h <- ifelse(str_detect(movielens$genres,"Adventure"),1,0)
+movielens$Horror1h <- ifelse(str_detect(movielens$genres,"Horror"),1,0)
+movielens$SciFi1h <- ifelse(str_detect(movielens$genres,"Sci-Fi"),1,0)
+movielens$Fantasy1h <- ifelse(str_detect(movielens$genres,"Fantasy"),1,0)
+#
+ml1 <- movielens %>% extract(title, c("title_tmp", "year"), regex = "^(.*) \\(([0-9 \\-]*)\\)$", 
+                             remove = F)
+ml1$year <- as.Date(paste(ml1$year,"-06-15",sep="")) 
+#using june 15th of the year for every movie since it is the middle of the year
+ml1$movieAGE <- as.double((ml1$timestamp - ml1$year)/365) 
+# calculate age of movie relative to each rating
+ml1$agegroup <- ifelse(ml1$movieAGE<=1,"1Y", ifelse(ml1$movieAGE<=3,"3Y", ifelse(ml1$movieAGE<=5,"5Y",
+                 ifelse(ml1$movieAGE<=10,"10Y", ifelse(ml1$movieAGE<15,"15Y", ifelse(ml1$movieAGE<=20,"20Y",
+                 ifelse(ml1$movieAGE<=30,"30Y",  ifelse(ml1$movieAGE<=50,"50Y","50plus"))))))))
+#
+movielens <- ml1 %>% select(-title) %>% rename(.,  "Title"=title_tmp)
+#
+rm(ml1)
+glimpse(movielens[1:3,])
+dim(movielens)
+summary(movielens)
+#
+
+```
+
+Take a look at how many movies came out each year:  
+
+```{r MoviesbyYear, echo=FALSE, warning=FALSE}
+# moviesbyyear
+movielens %>% select(movieId,year) %>% distinct(movieId,year) %>% group_by(year) %>% summarise(movies_produced=n(), .groups = "drop") %>% ggplot(aes(x=year,y=movies_produced))+geom_point()
+#
+```
+
+From here, I create the train/test split, and further split the training data into train/test so that I can rename my original test as "validation set"
+The math is 10M original -> 9M train, 1M test -> 8.5M train, 500k test, 1M validation  
+
+```{r split dataset, echo=FALSE, warning=FALSE, message=FALSE}
+# Split into training and validation sets
+# Validation set will be 10% of MovieLens data
+set.seed(135, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+#
+# Make sure userId and movieId in validation set are also in edx set
+test <- temp %>% semi_join(edx, by = "movieId") %>% semi_join(edx, by = "userId")
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, test)
+train <- rbind(edx, removed)
+#
+#
+rm( test_index, temp, movielens, removed, edx)
+#
+# split off train set into train, test and use test as true validation set (as intended!)
+validation <- test
+split <- train
+rm(test,train)
+#
+set.seed(737, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = split$rating, times = 1, p = 0.05, list = FALSE)
+temp1 <- split[-test_index,]
+temp2 <- split[test_index,]
+test <- temp2 %>% semi_join(temp1, by = "movieId") %>% semi_join(temp1, by = "userId")
+removed <- anti_join(temp2,test)
+train <- rbind(temp1,removed)
+#
+rm(test_index,removed,split,temp1,temp2)
+#
+paste("Here's a look at the training data up to now: ", sep="")
+glimpse(train[1:3,])
+#
+#
+#
+
+```
+
+Let's move into how I built out my model!
+
+## Part 2: Methodology / Motivation
+First, lets look into movies. You can see below that lots of movies have a few ratings, a few movies have a lot of ratings!  
+
+```{r movies1, echo=FALSE, warning=FALSE, message=FALSE}
+# movies bucket
+averagerating <- train %>% select(movieId,rating) %>% group_by(movieId) %>% summarise(movie_avgrating=mean(rating), movie_countofrating=n(), .groups = "drop")
+hist(averagerating$movie_countofrating, main = "Histogram of Rating Count", xlab = "# of Ratings")
+# Lots of movies have a few ratings, a few movies have a lot of ratings!
+#
+```
+
+Below I take a count of ratings by movie, arrange in descending order, and run a cumulative sum to total. This will show us how many movies it takes to achieve x% of total ratings in the data, and then I bucket based on how much the movie is "worth" as a % to total.  
+
+```{r movies2, echo=FALSE, warning=FALSE, message=FALSE}
+# take count of ratings by movie, arrange in descending order, and run cumulative sum
+# this will show us how many movies it takes to x% of total ratings in the data, and then I bucket based on how much the movie is "worth" as a %
+x <- averagerating %>% select(movieId,movie_countofrating) %>% unique(.)
+x <- x %>% arrange(.,-movie_countofrating)
+x$percent <- x$movie_countofrating/sum(x$movie_countofrating)
+x <- x %>% mutate(cumulative=cumsum(percent))
+x[1:10,]
+#
+x$movie_countbucket <- ifelse(x$cumulative<.1,"a", ifelse(x$cumulative<.2,"b",
+                       ifelse(x$cumulative<.3,"c", ifelse(x$cumulative<.4,"d",
+                        ifelse(x$cumulative<.5,"e",ifelse(x$cumulative<.6,"f",
+                        ifelse(x$cumulative<.7,"g", ifelse(x$cumulative<.8,"h",
+                        ifelse(x$cumulative<.9,"i","j")))))))))
+
+#
+table(x$movie_countbucket)
+```
+
+You can see above it takes 40 movies to make up the top decile of ratings, 66 movies make up the next decile, and so on.  
+Below, you'll see graphically how large of a tail there is with respect to movies that have very few ratings.  
+
+```{r movies3, echo=FALSE, warning=FALSE, message=FALSE}
+# 40 movies make up top decile of ratings, 66 movies make up next decile, and so on
+p <- cbind(x %>% select(movie_countbucket) %>% group_by(movie_countbucket) %>% summarise(n()),seq(1,10,1), .groups = "drop") %>% as.data.frame()
+colnames(p) <- c("MovieCountBucket","N","Seq")
+p %>% select(N,Seq) %>% ggplot(aes(x=Seq,y = N)) + geom_point() +geom_line()
+rm(p)
+# it is pretty easy to see how large of a tail the final few deciles make up
+#
+x1 <- x %>% select(movieId,movie_countbucket)
+#
+averagerating <- left_join(averagerating,x1)
+# 
+#
+```
+
+Not surprisingly, the buckets towards the beginning are rated higher. See below table:  
+
+```{r movies4, echo=FALSE, warning=FALSE, message=FALSE}
+# exploring average ratings and count of ratings
+averagerating %>% select(movie_countbucket,movie_avgrating) %>% group_by(movie_countbucket) %>% summarise(x=mean(movie_avgrating), .groups = "drop")
+```
+
+But, how strong of a correlation are these buckets to the average rating?  
+
+```{r movies5, echo=FALSE, warning=FALSE, message=FALSE}
+cor(averagerating$movie_avgrating,averagerating$movie_countofrating)
+```
+
+Below, I look into the table above but with some color. First I show Average Rating vs # of Ratings for all movies. Second, I show Average Rating vs # of Ratings for all movies except movies labeled as bucket A.  
+
+```{r movies6, echo=FALSE, warning=FALSE, message=FALSE, fig.height = 4, fig.width = 6, fig.align = "center"}
+averagerating %>% ggplot(aes(movie_avgrating,movie_countofrating, color=movie_countbucket)) + geom_point()+geom_jitter() + labs(x="Average Rating", y="# of Ratings", title="All Movies")
+# the spread of ratings count for bucket A is massive, what does it look like without it?
+averagerating %>% filter(movie_countbucket != "a")%>% ggplot(aes(movie_avgrating,movie_countofrating, color=movie_countbucket)) + geom_point() + labs(x="Average Rating", y="# of Ratings", title="Without 'A' Movies")
+#
+```
+
+You can certainly see a shape (perhaps non-linear) in the above plots. Generally speaking, the more ratings a movie has...the less variance there is in average rating (or at least the distance between min and max rating for that bucket is smaller!).  
+Here's what the training set looks like so far:  
+
+```{r movies7, echo=FALSE, warning=FALSE, message=FALSE}
+train <- left_join(train, averagerating, by = "movieId") # join average rating by movie, count of ratings by movie, and movie count bucket to the training set.
+#
+glimpse(train[1:3,])
+#
+movielookup <- averagerating
+rm(averagerating,x,x1)
+#
+#
+#
+
+```
+
+Next, let's look into users. Just like the movies above, a few people rate a ton of movies and a ton of people rate a few movies.  
+
+```{r users1, echo=FALSE, warning=FALSE, warning=FALSE}
+# user buckets
+usrrating <- train %>% select(userId,rating) %>% group_by(userId) %>% summarise(user_avgrating=mean(rating), usermovcount=n(), .groups = "drop")
+hist(usrrating$usermovcount, main = "Histogram of Ratings Given", xlab="# of Movies Rated")
+# a few people rate a ton of movies, a ton of people rate a few movies.
+summary(usrrating)
+# min is 10 movies, max is 6,271 movies (!) and median is 59...
+#
+```
+
+Above, you can see that there are users with 10 ratings given, there are users with 6,271 ratings given, the mean is 122 and median is 59. Talk about an enormous variance!  
+
+```{r users2, echo=FALSE, warning=FALSE, warning=FALSE}
+x <- usrrating %>% select(userId,usermovcount) %>% unique(.)
+x <- x %>% arrange(.,-usermovcount)
+x$percent <- x$usermovcount/sum(x$usermovcount)
+x <- x %>% mutate(cumulative=cumsum(percent))
+# similar to the movie exercise above, I am bucketing out the Users based on # of movies reviewed
+# bucketing into deciles, similar to above.
+x$user_countbucket <- ifelse(x$cumulative<.1,"a",  ifelse(x$cumulative<.2,"b",
+                       ifelse(x$cumulative<.3,"c", ifelse(x$cumulative<.4,"d",
+                       ifelse(x$cumulative<.5,"e",  ifelse(x$cumulative<.6,"f",
+                         ifelse(x$cumulative<.7,"g", ifelse(x$cumulative<.8,"h",
+                         ifelse(x$cumulative<.9,"i","j")))))))))
+
+
+#
+table(x$user_countbucket)
+```
+
+Just like the movie section, I bucket out the users into deciles as well. You can see that 643 users make up 10% of ratings. That means that ~1% of users make up 10% of ratings.  
+The figure below can illustrate this. The last two buckets account for ~43k users of the 69k total...but only 20% of ratings come from those users making up 2/3 of the user population!  
+
+```{r users3, echo=FALSE, warning=FALSE, message=FALSE}
+#
+# you can see above that 643 users account for the top decile of ratings. there is a huge tail at the end, and the last two buckets are ~43k users out of 69k total!
+p <- cbind(x %>% select(user_countbucket) %>% group_by(user_countbucket) %>% summarise(n()),seq(1,10,1), .groups = "drop") %>% as.data.frame()
+colnames(p) <- c("UserCountBucket","N","Seq")
+p %>% select(N,Seq) %>% ggplot(aes(x=Seq,y = N)) + geom_point() +geom_line()
+rm(p)
+#
+# not quite as drastic as the movie visual, but you can easily see the ramp up of users 
+#
+x1 <- x %>% select(userId,user_countbucket)
+usrrating <- left_join(usrrating,x1)
+#
+#
+#
+#
+train <- left_join(train, usrrating, by = "userId")
+#
+```
+
+A look at the training set through the above:  
+
+```{r users4, echo=FALSE, warning=FALSE, message=FALSE}
+glimpse(train[1:3,])
+#
+userlookup <- usrrating
+rm(usrrating,x,x1)
+#
+#
+#
+
+```
+
+Genre plays a big role as well. Below I show a glm fit on the one-hot encoding with echo=TRUE.  
+
+```{r genre1, echo=TRUE, warning=FALSE, warning=FALSE}
+# fitting Genre based on one-hot
+#
+gfit <- train %>% select(rating,8:17) %>% glm(formula = rating~., family = "gaussian")
+genre_coefficients <- gfit$coefficients
+#
+train$genrefit <- genre_coefficients[1]+
+  (train[,8]*genre_coefficients[2])+
+  (train[,9]*genre_coefficients[3])+
+  (train[,10]*genre_coefficients[4])+
+  (train[,11]*genre_coefficients[5])+
+  (train[,12]*genre_coefficients[6])+
+  (train[,13]*genre_coefficients[7])+
+  (train[,14]*genre_coefficients[8])+
+  (train[,15]*genre_coefficients[9])+
+  (train[,16]*genre_coefficients[10])+
+  (train[,17]*genre_coefficients[11])
+#
+```
+
+Here is the training set with the genre fit:  
+
+```{r genre2, echo=TRUE, warning=FALSE, warning=FALSE}
+glimpse(train[1:3,])
+rm(gfit)
+#
+```
+
+The age of a movie definitely plays a part as well. Below I take average rating by year the movie came out, and then average rating by the age group bucket I created earlier.  
+
+```{r movieage1, echo=FALSE, warning=FALSE, message=FALSE}
+# fitting movie age
+hist(train$movieAGE)
+#
+#
+avg_rating_by_year <- train %>% select(rating,year) %>% group_by(year) %>% summarise(avg_byyear = mean(rating), .groups = "drop")
+avg_rating_by_year[1:10,]
+avg_rating_byagegroup <- train %>% select(rating,agegroup) %>% group_by(agegroup) %>% summarise(avg_byagegroup = mean(rating), .groups = "drop")
+avg_rating_byagegroup
+#
+train <- left_join(train,avg_rating_byagegroup)
+train <- left_join(train,avg_rating_by_year)
+#
+```
+
+Here is the training set up to now:  
+
+```{r movieage2, echo=FALSE, warning=FALSE, message=FALSE}
+glimpse(train[1:3,])
+```
+
+In the next two tables, you can see that older movies (in general) have a better average rating.  
+
+```{r age_effect1, echo=FALSE, warning=FALSE, message=FALSE, fig.height = 4, fig.width = 6, fig.align = "center"}
+# exploring the time effect
+# older movies have a better rating on average...it is somewhat intuitive, if you are going back to watch a 30 year old movie, it is because you have heard of it, because it is good!
+train %>% select(year,rating) %>% group_by(year) %>% summarise(avgbyyear=mean(rating)) %>% ggplot(aes(x=year,y=avgbyyear))+geom_point()
+train %>% filter(user_countbucket != "a") %>% select(year,rating) %>% group_by(year) %>% summarise(avgbyyear=mean(rating)) %>% ggplot(aes(x=year,y=avgbyyear))+geom_point()
+#train %>% select(year,rating, user_countbucket) %>% group_by(year, user_countbucket) %>% summarise(avgbyyear=mean(rating)) %>% ggplot(aes(x=year,y=avgbyyear, col=user_countbucket))+geom_line()
+#
+```
+
+Below, you can see that movies that get reviewed more often are better...bucket A has most reviews, bucket J has the least...conversely, in the second table you can see that users that review more movies rate movies lower. I have two theories: 1) they are more critical and review with more thoughtfulness 2) they are more likely to run into a bad movie if they watch a ton of movies.  
+
+```{r age_effect2, echo=FALSE, warning=FALSE, message=FALSE}
+# movie count bucket effect
+movie_count_bucket_df <- train %>% select(rating,movie_countbucket) %>% group_by(movie_countbucket) %>% summarise(avg_bymovbucket = mean(rating))
+movie_count_bucket_df # movies that get reviewed more often are better...
+#
+train <- left_join(train,movie_count_bucket_df)
+#
+#rm(movie_count_bucket_df)
+#
+# user count bucket effect
+user_count_bucket_df <- train %>% select(rating, user_countbucket) %>% group_by(user_countbucket) %>% summarise(avg_byuserbucket = mean(rating))
+user_count_bucket_df # users that review less movies rate higher.
+#
+train <- left_join(train,user_count_bucket_df)
+#
+#rm(user_count_bucket_df)
+#
+```
+
+Below is a glimpse of the training set, the test set, and the validation set through now...  
+
+```{r age_effect3, echo=FALSE, warning=FALSE, message=FALSE}
+glimpse(train[1:3,])
+glimpse(test[1:3,])
+glimpse(validation[1:3,])
+#
+time2 <- Sys.time()
+as.numeric(time2-time1)
+```
+
+## Part 3: Modeling / Results
+
+Note that this section will include substantially more on screen R-code, as I readers to follow as "close to the code" as possible. First I fit the training set to the model I have built.  
+
+```{r modelFitting1, echo=TRUE, warning=FALSE}
+
+# y is rating,  
+# x's are 1movie_avgrating, 2user_avgrating, 3genrefit, 4avg by year,  5avg_byage, 6avg_bymovbucket, 7avg_byuserbucket
+lookup <- train %>% select(rating,movie_avgrating,user_avgrating,genrefit,avg_byyear,avg_byagegroup,avg_bymovbucket,avg_byuserbucket)
+fit <- lookup %>% glm(formula=rating~.,family="gaussian")
+fit_coefficients <- fit$coefficients
+fit_coefficients
+#
+train$yhat <- 
+  fit_coefficients[1]+
+  (fit_coefficients[2]*train$movie_avgrating)+
+  (fit_coefficients[3]*train$user_avgrating)+
+  (fit_coefficients[4]* train$genrefit)+
+  (fit_coefficients[5]*train$avg_byyear)+
+  (fit_coefficients[6]*train$avg_byagegroup)+
+  (fit_coefficients[7]*train$avg_bymovbucket)+
+  (fit_coefficients[8]*train$avg_byuserbucket)
+#
+#
+#
+```
+
+Below you will see a glimpse of the train set in its final form, with the Yhat prediction.
+The RMSE on the training set is reported below.  
+
+```{r modelFitting2, echo=TRUE, warning=FALSE}
+#
+dim(train)
+glimpse(train[1:3,])
+RMSE(train$rating,train$yhat)
+```
+
+Next I will fit the test set with the model I have generated. I'll need to join the new columns in, as the aggregations and averaging were only done on the training set (obviously!).  
+
+```{r modelFitting3, echo=TRUE, warning=FALSE, message=FALSE}
+#
+testing <- left_join(test,movielookup)
+testing <- left_join(testing,userlookup)
+testing <- left_join(testing,movie_count_bucket_df)
+testing <- left_join(testing,user_count_bucket_df)
+testing <- left_join(testing,avg_rating_by_year)
+testing <- left_join(testing,avg_rating_byagegroup)
+glimpse(testing[1:3,])
+testing$genrefit <- genre_coefficients[1]+
+  (testing[,8]*genre_coefficients[2])+
+  (testing[,9]*genre_coefficients[3])+
+  (testing[,10]*genre_coefficients[4])+
+  (testing[,11]*genre_coefficients[5])+
+  (testing[,12]*genre_coefficients[6])+
+  (testing[,13]*genre_coefficients[7])+
+  (testing[,14]*genre_coefficients[8])+
+  (testing[,15]*genre_coefficients[9])+
+  (testing[,16]*genre_coefficients[10])+
+  (testing[,17]*genre_coefficients[11])
+#
+glimpse(testing[1:3,])
+#
+testing$yhat <- fit_coefficients[1]+
+  (fit_coefficients[2]*testing$movie_avgrating)+
+  (fit_coefficients[3]*testing$user_avgrating)+
+  (fit_coefficients[4]*testing$genrefit)+
+  (fit_coefficients[5]*testing$avg_byyear)+
+  (fit_coefficients[6]*testing$avg_byagegroup)+
+  (fit_coefficients[7]*testing$avg_bymovbucket)+
+  (fit_coefficients[8]*testing$avg_byuserbucket)
+#
+```
+
+Below is a glimpse at the test set in its final form, with yhat predictions.
+The RMSE on the test set is reported below.  
+
+```{r modelFitting4, echo=TRUE,  warning=FALSE}
+glimpse(testing[1:3,])
+RMSE(testing$rating,testing$yhat)
+#
+```
+
+Finally, I will fit the validation set with the model I have generated. I'll need to join the new columns in just like the test set, as the aggregations and averaging were only done on the training set (obviously!! that is the most important part!).  
+
+```{r modelFitting5, echo=TRUE, warning=FALSE, message=FALSE}
+#
+testing <- left_join(validation,movielookup)
+testing <- left_join(testing,userlookup)
+testing <- left_join(testing,movie_count_bucket_df)
+testing <- left_join(testing,user_count_bucket_df)
+testing <- left_join(testing,avg_rating_by_year)
+testing <- left_join(testing,avg_rating_byagegroup)
+glimpse(testing[1:3,])
+testing$genrefit <- genre_coefficients[1]+
+  (testing[,8]*genre_coefficients[2])+
+  (testing[,9]*genre_coefficients[3])+
+  (testing[,10]*genre_coefficients[4])+
+  (testing[,11]*genre_coefficients[5])+
+  (testing[,12]*genre_coefficients[6])+
+  (testing[,13]*genre_coefficients[7])+
+  (testing[,14]*genre_coefficients[8])+
+  (testing[,15]*genre_coefficients[9])+
+  (testing[,16]*genre_coefficients[10])+
+  (testing[,17]*genre_coefficients[11])
+#
+glimpse(testing[1:3,])
+#
+testing$yhat <- fit_coefficients[1]+
+  (fit_coefficients[2]*testing$movie_avgrating)+
+  (fit_coefficients[3]*testing$user_avgrating)+
+  (fit_coefficients[4]*testing$genrefit)+
+  (fit_coefficients[5]*testing$avg_byyear)+
+  (fit_coefficients[6]*testing$avg_byagegroup)+
+  (fit_coefficients[7]*testing$avg_bymovbucket)+
+  (fit_coefficients[8]*testing$avg_byuserbucket)
+#
+```
+
+Below is a glimpse at the validation set in its final form, with yhat predictions.
+The RMSE on the validation set is reported below.  
+
+```{r modelFitting6, echo=TRUE, warning=FALSE}
+glimpse(testing[1:3,])
+RMSE(testing$rating,testing$yhat)
+#
+```
+
+## Part 4: Conclusion / Remarks
+
+The RMSE that I was able to achieve did not meet my expectations. When I started this project, I had quite a few ideas about how to tackle it...but one thing I can say with certainty is that I underestimated the difficult task of making 1 million predictions! It's not only hard to do this accurately, but it takes time to run through 1 million rows too.
+
+Overall, this exercise was extremely fun and reinforced so many of the skills I learned in this certificate program. One consideration I want to bring up is that I would want to see how the modeling from this research would progress if I had access to significantly more computing power. While a 16gb RAM/i5 machine is satisfactory, there are computers out there that may be able to use certain clustering algorithms to create user profiles, and then model out predictions based on those profiles with a linear model or regression tree. As we covered in the Machine Learning course, this dataset is far too large to fit a true model with a standard laptop (which makes me jealous). 
+
+Thank you for following along, and I welcome any feedback that you have.
+
+Craig Barnes | craig.michael.barnes@gmail.com
